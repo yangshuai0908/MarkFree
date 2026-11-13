@@ -7,6 +7,7 @@ import {
   Progress,
   Radio,
   Slider,
+  Switch,
 } from 'ant-design-vue'
 import 'ant-design-vue/dist/reset.css'
 import './style.css'
@@ -15,7 +16,7 @@ import App from './App.vue'
 
 const app = createApp(App)
 
-for (const component of [Button, Checkbox, Input, Layout, Progress, Radio, Slider]) {
+for (const component of [Button, Checkbox, Input, Layout, Progress, Radio, Slider, Switch]) {
   app.use(component)
 }
 
