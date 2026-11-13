@@ -6,6 +6,13 @@ import JSZip from "jszip";
 const fileInput = ref<HTMLInputElement>();
 const logoInput = ref<HTMLInputElement>();
 const canvasRef = ref<HTMLCanvasElement>();
+const settingsTab = ref<"content" | "style" | "layout">("content");
+const settingsTabs = [
+  { value: "content", label: "内容" },
+  { value: "style", label: "样式" },
+  { value: "layout", label: "布局" },
+] as const;
+const settingsTabIndex = computed(() => settingsTabs.findIndex(tab => tab.value === settingsTab.value));
 
 // ── Batch image list ──
 interface ImageItem {
@@ -80,14 +87,28 @@ const rotation = setting("rotation");
 const repeat = setting("repeat");
 const offsetX = setting("offsetX");
 const offsetY = setting("offsetY");
+const positionOptions = [
+  { label: "左上角", value: "left-top", x: 0.15, y: 0.1 },
+  { label: "居中", value: "center", x: 0.5, y: 0.5 },
+  { label: "右下角", value: "right-bottom", x: 0.8, y: 0.85 },
+];
 const position = computed({
   get: () => currentSettings.value.position,
   set: (value: string) => {
     const settings = currentSettings.value;
-    settings.position = value;
-    settings.offsetX = value === "left-top" ? 0.15 : value === "center" ? 0.5 : 0.8;
-    settings.offsetY = value === "left-top" ? 0.1 : value === "center" ? 0.5 : 0.85;
+    const preset = positionOptions.find(option => option.value === value) ?? positionOptions[2]!;
+    settings.position = preset.value;
+    settings.offsetX = preset.x;
+    settings.offsetY = preset.y;
   },
+});
+// Dragging can move the watermark away from its last preset.
+const selectedPositionIndex = computed(() => positionOptions.findIndex(option =>
+  Math.abs(offsetX.value - option.x) < 0.000001 && Math.abs(offsetY.value - option.y) < 0.000001,
+));
+const selectedPosition = computed({
+  get: () => positionOptions[selectedPositionIndex.value]?.value ?? "",
+  set: (value: string) => { position.value = value; },
 });
 const customWatermark = computed({
   get: () => !!activeItem.value?.watermark,
@@ -610,805 +631,434 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="image-editor space-y-4 lg:space-y-6">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h1 class="text-2xl font-bold text-foreground">图片水印</h1>
-        <p class="mt-1 text-sm text-muted-foreground">
-          上传图片，自定义水印，保护你的作品版权。支持批量处理。
-        </p>
+  <div class="image-editor">
+    <header class="workspace-toolbar">
+      <div class="workspace-heading">
+        <h1>图片水印</h1>
+        <span class="workspace-subtitle">{{ hasImages ? '已导入 ' + images.length + ' 张图片' : '为每一张图片，留下你的标记' }}</span>
       </div>
-
-      <div class="export-actions flex gap-2" :class="{ 'single-export': images.length <= 1 }" role="group" aria-label="导出图片">
-        <a-button :type="images.length > 1 ? 'default' : 'primary'" :disabled="!activeItem || !canvasRef || batchProcessing" @click="downloadSingle">
-          {{ images.length > 1 ? '导出当前' : '导出' }}
+      <div class="toolbar-actions">
+        <a-button v-if="hasImages" class="import-action" :disabled="batchProcessing" @click="selectImage">
+          <span aria-hidden="true">＋</span> 添加图片
         </a-button>
-        <a-button
-          v-if="images.length > 1"
-          type="primary"
-          :disabled="!hasImages || batchProcessing"
-          :loading="batchProcessing"
-          @click="downloadBatchZip"
-        >
-          {{ batchProcessing ? (exportStage === 'packing' ? '正在打包 ZIP…' : `处理中 ${batchProgress}/${batchTotal}`) : `批量下载 ZIP${images.length ? ` (${images.length})` : ''}` }}
-        </a-button>
+        <div class="export-actions" :class="{ 'single-export': images.length <= 1 }" role="group" aria-label="导出图片">
+          <a-button :type="images.length > 1 ? 'default' : 'primary'" :disabled="!activeItem || !canvasRef || batchProcessing" :loading="batchProcessing && exportKind === 'single'" @click="downloadSingle">
+            {{ images.length > 1 ? '导出当前' : '导出' }}
+          </a-button>
+          <a-button v-if="images.length > 1" type="primary" :disabled="batchProcessing" :loading="batchProcessing && exportKind === 'zip'" @click="downloadBatchZip">
+            {{ batchProcessing && exportKind === 'zip' ? (exportStage === 'packing' ? '正在打包 ZIP…' : '处理中 ' + batchProgress + '/' + batchTotal) : '批量下载 ZIP (' + images.length + ')' }}
+          </a-button>
+        </div>
       </div>
-    </div>
+    </header>
 
-    <input
-      ref="fileInput"
-      type="file"
-      accept="image/png,image/jpeg,image/webp"
-      class="hidden"
-      multiple
-      @change="handleFileChange"
-    />
-    <input
-      ref="logoInput"
-      type="file"
-      accept="image/png,image/jpeg,image/webp,image/svg+xml"
-      class="hidden"
-      @change="handleLogoChange"
-    />
+    <input ref="fileInput" type="file" accept="image/png,image/jpeg,image/webp" class="hidden" multiple @change="handleFileChange" />
+    <input ref="logoInput" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" class="hidden" @change="handleLogoChange" />
 
     <Transition name="content">
-      <div v-if="exportStage !== 'idle'" class="export-status" :class="`export-status--${exportStage}`" role="status" aria-live="polite" aria-atomic="true">
+      <div v-if="exportStage !== 'idle'" class="export-status" :class="'export-status--' + exportStage" role="status" aria-live="polite" aria-atomic="true">
         <svg :key="exportStage" class="status-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
           <circle v-if="batchProcessing" class="status-spinner" cx="12" cy="12" r="8" />
           <path v-else-if="exportStage === 'done'" class="status-check" d="m5 12 4 4L19 6" />
           <path v-else d="m7 7 10 10M17 7 7 17" />
         </svg>
-        <div class="min-w-0 flex-1">
-          <span class="text-sm font-medium">{{ exportLabel }}</span>
-          <a-progress
-            v-if="batchProcessing"
-            :key="exportStage"
-            :percent="exportStage === 'packing' ? packingProgress : Math.round((batchProgress / batchTotal) * 100)"
-            :show-info="false"
-            status="active"
-            size="small"
-          />
+        <div class="status-content">
+          <span>{{ exportLabel }}</span>
+          <a-progress v-if="batchProcessing" :key="exportStage" :percent="exportStage === 'packing' ? packingProgress : Math.round((batchProgress / batchTotal) * 100)" :show-info="false" status="active" size="small" />
         </div>
       </div>
     </Transition>
 
-    <a-row :gutter="[16, 16]">
-      <a-col :xs="24" :lg="16">
-        <a-card id="image-preview" class="editor-card h-full">
-          <template #title>
-            <div class="flex items-center justify-between">
-              <span>图片预览</span>
-              <a href="#watermark-settings" class="section-link lg:hidden">调整水印 ↓</a>
-              <span v-if="hasImages" class="text-xs font-normal text-muted-foreground">
-                {{ activeIndex + 1 }} / {{ images.length }}
-              </span>
-            </div>
-          </template>
-
-          <!-- Upload area -->
+    <main class="editor-workspace">
+      <section id="image-preview" class="preview-panel" aria-labelledby="preview-title">
+        <header class="panel-header">
+          <div class="panel-heading">
+            <h2 id="preview-title">图片预览</h2>
+            <span class="live-label"><i></i>实时预览</span>
+          </div>
+          <a href="#watermark-settings" class="section-link">调整水印 ↓</a>
+          <span v-if="hasImages" class="image-counter">{{ activeIndex + 1 }} <span>/ {{ images.length }}</span></span>
+        </header>
+        <div class="preview-body">
           <Transition name="content" mode="out-in">
-            <div
-              v-if="!hasImages"
-              key="upload"
-              class="upload-area flex min-h-[280px] cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed p-5 text-center lg:min-h-[420px]"
-              :class="{ 'is-file-dragging': uploadDragDepth > 0 }"
-              role="group"
-              aria-label="导入图片"
-              @click="selectImage"
-              @pointermove="moveSpotlight"
-              @dragenter.prevent="uploadDragDepth++"
-              @dragover.prevent
-              @dragleave.prevent="uploadDragDepth = Math.max(0, uploadDragDepth - 1)"
-              @drop.prevent="handleDrop"
-            >
+            <div v-if="!hasImages" key="upload" class="upload-area" :class="{ 'is-file-dragging': uploadDragDepth > 0 }" role="group" aria-label="导入图片"
+              @click="selectImage" @pointermove="moveSpotlight" @dragenter.prevent="uploadDragDepth++" @dragover.prevent
+              @dragleave.prevent="uploadDragDepth = Math.max(0, uploadDragDepth - 1)" @drop.prevent="handleDrop">
               <div class="upload-art" aria-hidden="true">
                 <div class="upload-art-back"></div>
                 <div class="upload-art-front">
                   <svg width="42" height="42" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="5" y="5" width="30" height="30" rx="6" />
-                    <circle cx="15" cy="15" r="3" />
-                    <path d="m6 29 9-9 6 6 6-9 8 12" />
+                    <rect x="5" y="5" width="30" height="30" rx="6" /><circle cx="15" cy="15" r="3" /><path d="m6 29 9-9 6 6 6-9 8 12" />
                   </svg>
                 </div>
                 <span class="upload-art-plus">+</span>
               </div>
-              <h3 class="text-lg font-semibold text-foreground">
-                {{ uploadDragDepth > 0 ? '松开鼠标，导入图片' : '上传图片开始编辑' }}
-              </h3>
-              <p class="mt-2 text-sm text-muted-foreground">
-                拖拽图片到这里，或点击选择 · 支持批量处理
-              </p>
-              <a-button type="primary" size="large" class="upload-button mt-5">选择图片 <span aria-hidden="true">↗</span></a-button>
-              <p class="upload-formats mt-4 text-xs text-muted-foreground">JPG / PNG / WebP · 单张最大 50MB</p>
-              <span class="upload-privacy mt-5 text-xs text-muted-foreground">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/></svg>
-                本地处理，图片不会离开你的设备
+              <span class="upload-eyebrow">从一张图片开始</span>
+              <h3>{{ uploadDragDepth > 0 ? '松开鼠标，导入图片' : '把图片拖到这里' }}</h3>
+              <p>支持多选，轻松为整组图片添加水印</p>
+              <a-button type="primary" size="large" class="upload-button">选择图片 <span aria-hidden="true">↗</span></a-button>
+              <span class="upload-formats">JPG / PNG / WebP · 单张最大 50MB</span>
+              <span class="upload-privacy">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z" /><path d="m8 12 3 3 5-6" /></svg>
+                图片不会离开你的设备
               </span>
             </div>
-
-            <!-- Preview + thumbnails -->
-            <div v-else key="preview" class="space-y-4">
-              <div class="flex min-w-0 flex-col gap-3 sm:flex-row sm:justify-between">
-                <span class="min-w-0 text-sm text-muted-foreground">
-                  {{ activeItem?.img.naturalWidth }} × {{ activeItem?.img.naturalHeight }}
-                  <span class="block truncate text-xs" :title="activeItem?.name">{{ activeItem?.name }}</span>
-                </span>
-                <div class="flex shrink-0 gap-2">
-                  <a-button size="small" :disabled="batchProcessing" @click="selectImage">添加图片</a-button>
-                  <a-button size="small" danger :disabled="batchProcessing" @click="clearAllImages">清空全部</a-button>
-                </div>
+            <div v-else key="preview" class="preview-content">
+              <div class="image-meta">
+                <span class="image-filename" :title="activeItem?.name">{{ activeItem?.name }}</span>
+                <span>{{ activeItem?.img.naturalWidth }} × {{ activeItem?.img.naturalHeight }} px</span>
               </div>
-
-              <div
-                class="preview-stage flex min-h-[180px] items-center justify-center overflow-hidden rounded-lg bg-muted p-2 lg:min-h-[300px] lg:p-3"
-              >
-                <canvas
-                  ref="canvasRef"
-                  class="preview-canvas max-h-[600px] max-w-full object-contain"
-                  :class="{ 'cursor-crosshair': !repeat }"
+              <div class="preview-stage">
+                <canvas ref="canvasRef" class="preview-canvas" :class="{ 'cursor-crosshair': !repeat }"
                   :style="{ touchAction: !repeat && touchDragEnabled ? 'none' : 'pan-y pinch-zoom' }"
-                  @pointerdown="handlePointerDown"
-                  @pointermove="handlePointerMove"
-                  @pointerup="handlePointerUp"
-                  @pointercancel="handlePointerUp"
-                  @lostpointercapture="handlePointerUp"
-                />
+                  @pointerdown="handlePointerDown" @pointermove="handlePointerMove" @pointerup="handlePointerUp"
+                  @pointercancel="handlePointerUp" @lostpointercapture="handlePointerUp" />
               </div>
-
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <p class="!mb-0 text-xs text-muted-foreground">
-                  {{ repeat ? "当前为平铺水印模式" : touchDragEnabled ? "拖动图片调整水印，完成后关闭移动" : "鼠标可直接拖动，触屏请先开启移动" }}
-                </p>
-                <a-button
-                  v-if="!repeat"
-                  class="touch-drag-toggle"
-                  :type="touchDragEnabled ? 'primary' : 'default'"
-                  :aria-pressed="touchDragEnabled"
-                  @click="touchDragEnabled = !touchDragEnabled"
-                >
+              <div class="preview-caption">
+                <span>{{ repeat ? '平铺水印 · 覆盖整张图片' : touchDragEnabled ? '拖动图片调整水印，完成后关闭移动' : '单个水印 · 可在预览中拖动调整位置' }}</span>
+                <a-button v-if="!repeat" class="touch-drag-toggle" size="small" :type="touchDragEnabled ? 'primary' : 'default'" :aria-pressed="touchDragEnabled" @click="touchDragEnabled = !touchDragEnabled">
                   {{ touchDragEnabled ? '完成移动' : '移动水印' }}
                 </a-button>
-              </div>
-
-              <!-- Thumbnail strip -->
-              <div v-if="images.length > 1" class="thumbnail-strip flex gap-3 overflow-x-auto rounded-lg border border-border bg-muted p-2" aria-label="已导入的图片">
-                <div
-                  v-for="(item, idx) in images"
-                  :key="item.id"
-                  class="relative shrink-0"
-                >
-                  <button
-                    type="button"
-                    class="block rounded-md"
-                    :aria-label="`预览第 ${idx + 1} 张图片：${item.name}（${item.watermark ? '单独水印' : '统一水印'}）`"
-                    :aria-pressed="idx === activeIndex"
-                    @click="switchImage(idx)"
-                  >
-                    <img
-                      :src="item.url"
-                      class="h-16 w-16 rounded-md object-cover transition"
-                      :class="idx === activeIndex ? 'ring-2 ring-primary' : 'opacity-60 hover:opacity-100'"
-                      :alt="item.name"
-                    />
-                  </button>
-                  <span v-if="item.watermark" class="pointer-events-none absolute right-0 top-11 rounded-br-md rounded-tl-md bg-primary px-1 text-[10px] text-primary-foreground">单独</span>
-                  <button
-                    type="button"
-                    class="thumbnail-remove absolute -right-1 -top-1 flex h-6 w-6 items-center justify-center rounded-full bg-destructive text-xs text-destructive-foreground"
-                    :aria-label="`删除第 ${idx + 1} 张图片：${item.name}`"
-                    :disabled="batchProcessing"
-                    @click.stop="removeImage(idx)"
-                  >
-                    ×
-                  </button>
-                  <span class="pointer-events-none absolute left-0 top-11 w-6 rounded-tr-md bg-black/50 px-1 text-center text-[10px] text-white">
-                    {{ idx + 1 }}
-                  </span>
-                </div>
+                <span class="scope-caption">{{ customWatermark ? '当前图片单独设置' : '使用统一水印' }}</span>
               </div>
             </div>
           </Transition>
-        </a-card>
-      </a-col>
+        </div>
+        <footer v-if="hasImages" class="image-library">
+          <div class="library-header">
+            <span>图片列表 <b>{{ images.length }}</b></span>
+            <div class="library-actions">
+              <a-button type="text" size="small" :disabled="batchProcessing" @click="removeImage(activeIndex)">删除当前</a-button>
+              <a-button type="text" size="small" danger :disabled="batchProcessing" @click="clearAllImages">清空</a-button>
+            </div>
+          </div>
+          <div class="thumbnail-strip" aria-label="已导入的图片">
+            <button v-for="(item, idx) in images" :key="item.id" type="button" class="thumbnail-button" :class="{ 'is-selected': idx === activeIndex }"
+              :aria-label="'预览第 ' + (idx + 1) + ' 张图片：' + item.name + '（' + (item.watermark ? '单独水印' : '统一水印') + '）'" :aria-pressed="idx === activeIndex" @click="switchImage(idx)">
+              <span class="thumbnail-image"><img :src="item.url" :alt="item.name" /><span class="thumbnail-number">{{ idx + 1 }}</span><span v-if="item.watermark" class="thumbnail-custom">单独</span></span>
+              <span class="thumbnail-name" :title="item.name">{{ item.name }}</span>
+            </button>
+            <button type="button" class="thumbnail-add" :disabled="batchProcessing" @click="selectImage"><span aria-hidden="true">＋</span>添加图片</button>
+          </div>
+        </footer>
+      </section>
 
-      <a-col :xs="24" :lg="8">
-        <a-card id="watermark-settings" class="editor-card h-full">
-          <template #title>
-            <div class="flex items-center justify-between gap-2">
-              <span>水印设置</span>
-              <a href="#image-preview" class="section-link lg:hidden">查看预览 ↑</a>
-            </div>
-          </template>
-          <fieldset class="settings-fields space-y-5" :disabled="batchProcessing">
-            <div v-if="activeItem" class="rounded-lg border border-border bg-muted p-3">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <a-checkbox v-model:checked="customWatermark" :disabled="batchProcessing">单独设置当前图片</a-checkbox>
-                <a-button v-if="customWatermark" size="small" :disabled="batchProcessing" @click="customWatermark = false">恢复统一设置</a-button>
-              </div>
-              <p class="!mb-0 mt-2 text-xs text-muted-foreground" aria-live="polite">
-                {{ customWatermark ? '仅修改当前图片，其他图片不受影响。' : '当前使用统一设置，修改会应用到所有未单独设置的图片。' }}
-              </p>
-              <p v-if="customWatermark" class="!mb-0 mt-1 truncate text-xs text-primary" :title="activeItem.name">{{ activeItem.name }}</p>
-            </div>
-            <!-- Watermark type toggle -->
-            <div>
-              <label class="mb-2 block text-sm font-medium text-foreground">水印类型</label>
-              <div class="watermark-type" :class="{ 'is-logo': watermarkType === 'logo' }">
-                <span class="type-indicator" aria-hidden="true"></span>
-                <a-radio-group
-                  v-model:value="watermarkType"
-                  :disabled="batchProcessing"
-                  aria-label="水印类型"
-                  class="w-full"
-                >
-                  <a-radio-button value="text" class="!w-1/2 !text-center">文字水印</a-radio-button>
-                  <a-radio-button value="logo" class="!w-1/2 !text-center">Logo 水印</a-radio-button>
-                </a-radio-group>
-              </div>
-            </div>
-
+      <aside id="watermark-settings" class="settings-panel" aria-labelledby="settings-title">
+        <header class="panel-header">
+          <div class="panel-heading"><h2 id="settings-title">水印设置</h2><span class="panel-subtitle">即时生效</span></div>
+          <a href="#image-preview" class="section-link">查看预览 ↑</a>
+        </header>
+        <div class="settings-scope">
+          <div class="scope-heading"><span>应用范围</span><span class="scope-badge" :class="{ 'is-custom': customWatermark }">{{ customWatermark ? '仅当前图片' : '统一设置' }}</span></div>
+          <div v-if="activeItem" class="scope-controls">
+            <a-checkbox v-model:checked="customWatermark" :disabled="batchProcessing">单独设置当前图片</a-checkbox>
+            <a-button v-if="customWatermark" type="link" size="small" :disabled="batchProcessing" @click="customWatermark = false">恢复统一设置</a-button>
+          </div>
+          <p class="scope-note" aria-live="polite" :title="customWatermark ? activeItem?.name : undefined">{{ customWatermark ? activeItem?.name + ' · 修改仅对此图片生效' : '修改会应用到所有未单独设置的图片' }}</p>
+        </div>
+        <div class="settings-navigation">
+          <div class="watermark-type settings-tabs" :style="{ '--segment-count': 3, '--active-index': settingsTabIndex }">
+            <span class="type-indicator" aria-hidden="true"></span>
+            <a-radio-group v-model:value="settingsTab" aria-label="设置分区" class="w-full">
+              <a-radio-button v-for="tab in settingsTabs" :key="tab.value" :value="tab.value">{{ tab.label }}</a-radio-button>
+            </a-radio-group>
+          </div>
+        </div>
+        <div class="settings-scroll">
+          <fieldset class="settings-fields" :disabled="batchProcessing">
             <Transition name="settings" mode="out-in">
-              <div :key="watermarkType" class="space-y-5">
-                <!-- Text watermark settings -->
-                <template v-if="watermarkType === 'text'">
-                  <div>
-                    <label class="mb-2 block text-sm font-medium text-foreground">水印文字</label>
-                    <a-textarea
-                      v-model:value="watermarkText"
-                      :disabled="batchProcessing"
-                      aria-label="水印文字"
-                      :rows="3"
-                      placeholder="请输入水印内容"
-                      :maxlength="100"
-                      show-count
-                    />
+              <div :key="settingsTab" class="settings-page">
+                <template v-if="settingsTab === 'content'">
+                  <div class="setting-section-title"><h3>水印内容</h3><p>选择文字，或上传你的品牌 Logo</p></div>
+                  <div class="watermark-type" :style="{ '--active-index': watermarkType === 'logo' ? 1 : 0 }">
+                    <span class="type-indicator" aria-hidden="true"></span>
+                    <a-radio-group v-model:value="watermarkType" :disabled="batchProcessing" aria-label="水印类型" class="w-full">
+                      <a-radio-button value="text">文字水印</a-radio-button><a-radio-button value="logo">Logo 水印</a-radio-button>
+                    </a-radio-group>
                   </div>
-
-                  <div>
-                    <label class="mb-2 block text-sm font-medium text-foreground">水印颜色</label>
-                    <div class="flex flex-wrap items-center gap-3">
-                      <input
-                        type="color"
-                        v-model="watermarkColor"
-                        :disabled="batchProcessing"
-                        aria-label="自定义水印颜色"
-                        class="h-11 w-12 cursor-pointer rounded-md border border-border bg-transparent p-0.5"
-                      />
-                      <span class="text-sm text-muted-foreground">{{ watermarkColor }}</span>
-                      <div class="color-presets flex flex-wrap gap-2">
-                        <button
-                          v-for="c in ['#ffffff', '#000000', '#ff4d4f', '#1677ff', '#52c41a', '#faad14']"
-                          :key="c"
-                          type="button"
-                          :aria-label="`水印颜色 ${c}`"
-                          :aria-pressed="watermarkColor === c"
-                          class="h-11 w-11 rounded-full border-2 transition-transform hover:scale-110 lg:h-6 lg:w-6"
-                          :class="watermarkColor === c ? 'border-primary scale-110' : 'border-border'"
-                          :style="{ backgroundColor: c }"
-                          @click="watermarkColor = c"
-                        />
+                  <Transition name="settings" mode="out-in">
+                    <div :key="watermarkType" class="content-fields">
+                      <div v-if="watermarkType === 'text'" class="setting-field">
+                        <label>水印文字</label>
+                        <a-textarea v-model:value="watermarkText" :disabled="batchProcessing" aria-label="水印文字" :rows="4" placeholder="输入你的水印内容" :maxlength="100" show-count />
+                        <p class="field-note">简短的文字，让图片保留更多细节。</p>
+                      </div>
+                      <div v-else class="setting-field">
+                        <label>Logo 图片</label>
+                        <button v-if="!hasLogo" type="button" class="logo-upload" @click="selectLogo">
+                          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4" /><circle cx="9" cy="9" r="2" /><path d="m3 17 6-5 4 4 3-5 5 6" /></svg>
+                          <span>点击上传 Logo</span><small>PNG / JPG / WebP / SVG · 最大 10MB</small>
+                        </button>
+                        <div v-else class="logo-summary">
+                          <img :src="logoUrl" alt="Logo" />
+                          <div><strong>{{ logoImage?.naturalWidth }} × {{ logoImage?.naturalHeight }}</strong><span>Logo 已就绪</span></div>
+                          <a-button size="small" @click="selectLogo">更换</a-button><a-button size="small" danger @click="removeLogo">删除</a-button>
+                        </div>
+                        <p class="field-note">透明背景的 Logo，融合效果更自然。</p>
                       </div>
                     </div>
-                  </div>
-
-                  <div>
-                    <div class="mb-2 flex justify-between">
-                      <label class="text-sm font-medium text-foreground">字体大小</label>
-                      <span class="text-sm text-primary">{{ fontSize }}px</span>
-                    </div>
-                    <a-slider v-model:value="fontSize" :disabled="batchProcessing" :min="12" :max="120" aria-label-for-handle="字体大小" />
-                  </div>
+                  </Transition>
                 </template>
 
-                <!-- Logo watermark settings -->
-                <template v-if="watermarkType === 'logo'">
-                  <div>
-                    <label class="mb-2 block text-sm font-medium text-foreground">Logo 图片</label>
-                    <button
-                      v-if="!hasLogo"
-                      type="button"
-                      class="flex w-full cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-muted p-6 transition hover:border-primary hover:bg-accent"
-                      @click="selectLogo"
-                    >
-                      <svg class="text-primary" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="9" cy="9" r="2"/><path d="m3 17 6-5 4 4 3-5 5 6"/></svg>
-                      <span class="text-sm text-muted-foreground">点击上传 Logo</span>
-                      <span class="text-xs text-muted-foreground">PNG / JPG / WebP / SVG · 最大 10MB</span>
-                    </button>
-                    <div
-                      v-else
-                      class="flex items-center gap-3 rounded-lg border border-border bg-muted p-3"
-                    >
-                      <img :src="logoUrl" class="h-12 w-12 rounded object-contain" alt="Logo" />
-                      <div class="min-w-0 flex-1">
-                        <p class="truncate text-sm text-foreground">
-                          {{ logoImage?.naturalWidth }} × {{ logoImage?.naturalHeight }}
-                        </p>
-                        <p class="text-xs text-muted-foreground">已上传</p>
-                      </div>
-                      <div class="flex shrink-0 flex-wrap gap-1">
-                        <a-button size="small" @click="selectLogo">更换</a-button>
-                        <a-button size="small" danger @click="removeLogo">删除</a-button>
+                <template v-else-if="settingsTab === 'style'">
+                  <div class="setting-section-title"><h3>{{ watermarkType === 'text' ? '文字样式' : 'Logo 样式' }}</h3><p>调整大小与透明度，找到恰好的存在感</p></div>
+                  <template v-if="watermarkType === 'text'">
+                    <div class="setting-field">
+                      <label>水印颜色</label>
+                      <div class="color-options">
+                        <label class="color-custom"><input type="color" v-model="watermarkColor" :disabled="batchProcessing" aria-label="自定义水印颜色" /><span>{{ watermarkColor.toUpperCase() }}</span></label>
+                        <div class="color-presets">
+                          <button v-for="c in ['#ffffff', '#000000', '#ff4d4f', '#1677ff', '#52c41a', '#faad14']" :key="c" type="button" :aria-label="'水印颜色 ' + c" :aria-pressed="watermarkColor === c" :class="{ 'is-selected': watermarkColor === c }" :style="{ '--swatch-color': c }" @click="watermarkColor = c"><span></span></button>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                    <div class="setting-field"><div class="field-heading"><label>字体大小</label><output>{{ fontSize }}<small>px</small></output></div><a-slider v-model:value="fontSize" :disabled="batchProcessing" :min="12" :max="120" aria-label-for-handle="字体大小" /><div class="range-labels"><span>12 px</span><span>120 px</span></div></div>
+                  </template>
+                  <div v-else class="setting-field"><div class="field-heading"><label>Logo 大小</label><output>{{ logoScale }}<small>%</small></output></div><a-slider v-model:value="logoScale" :disabled="batchProcessing" :min="3" :max="60" aria-label-for-handle="Logo 大小" /><div class="range-labels"><span>3%</span><span>60%</span></div></div>
+                  <div class="setting-field"><div class="field-heading"><label>透明度</label><output>{{ opacity }}<small>%</small></output></div><a-slider v-model:value="opacity" :disabled="batchProcessing" :min="5" :max="100" aria-label-for-handle="透明度" /><div class="range-labels"><span>轻盈</span><span>清晰</span></div></div>
+                  <div class="setting-field"><div class="field-heading"><label>旋转角度</label><output>{{ rotation }}<small>°</small></output></div><a-slider v-model:value="rotation" :disabled="batchProcessing" :min="-90" :max="90" aria-label-for-handle="旋转角度" /><div class="range-labels"><span>−90°</span><span>90°</span></div></div>
+                </template>
 
-                  <div>
-                    <div class="mb-2 flex justify-between">
-                      <label class="text-sm font-medium text-foreground">Logo 大小</label>
-                      <span class="text-sm text-primary">{{ logoScale }}%</span>
+                <template v-else>
+                  <div class="setting-section-title"><h3>水印布局</h3><p>整张覆盖，或只在一个位置轻轻标记</p></div>
+                  <div class="setting-field">
+                    <label>布局方式</label>
+                    <div class="watermark-type layout-toggle" :style="{ '--active-index': repeat ? 0 : 1 }">
+                      <span class="type-indicator" aria-hidden="true"></span>
+                      <a-radio-group v-model:value="repeat" :disabled="batchProcessing" aria-label="水印布局" class="w-full">
+                        <a-radio-button :value="true"><span class="layout-option"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3.5" y="3.5" width="6" height="6" rx="1.5" /><rect x="14.5" y="3.5" width="6" height="6" rx="1.5" /><rect x="3.5" y="14.5" width="6" height="6" rx="1.5" /><rect x="14.5" y="14.5" width="6" height="6" rx="1.5" /></svg>平铺水印</span></a-radio-button>
+                        <a-radio-button :value="false"><span class="layout-option"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="3" /><rect x="13" y="13" width="4" height="4" rx="1" fill="currentColor" stroke="none" /></svg>单个水印</span></a-radio-button>
+                      </a-radio-group>
                     </div>
-                    <a-slider v-model:value="logoScale" :disabled="batchProcessing" :min="3" :max="60" aria-label-for-handle="Logo 大小" />
+                    <p class="field-note">{{ repeat ? '覆盖整张图片，适合证件与资料保护。' : '选择预设位置，也可在预览中拖动微调。' }}</p>
                   </div>
+                  <Transition name="layout-options">
+                    <div v-if="!repeat" class="position-reveal">
+                      <div class="position-panel setting-field">
+                        <div class="field-heading"><label>水印位置</label><span v-if="selectedPositionIndex < 0" class="field-note">已手动调整</span></div>
+                        <div class="watermark-type position-options" :style="{ '--segment-count': 3, '--active-index': Math.max(0, selectedPositionIndex) }">
+                          <span class="type-indicator" :style="{ opacity: selectedPositionIndex < 0 ? 0 : 1 }" aria-hidden="true"></span>
+                          <a-radio-group v-model:value="selectedPosition" :disabled="batchProcessing" aria-label="水印位置" class="w-full">
+                            <a-radio-button v-for="option in positionOptions" :key="option.value" :value="option.value"><span class="layout-option"><svg width="34" height="27" viewBox="0 0 32 26" fill="none" aria-hidden="true"><rect x="3" y="3" width="26" height="20" rx="4" stroke="currentColor" stroke-width="1.3" opacity=".5" /><rect :x="4 + option.x * 24 - 2" :y="4 + option.y * 18 - 1.5" width="4" height="3" rx="1" fill="currentColor" /></svg>{{ option.label }}</span></a-radio-button>
+                          </a-radio-group>
+                        </div>
+                      </div>
+                    </div>
+                  </Transition>
                 </template>
               </div>
             </Transition>
-
-            <!-- Common settings -->
-            <div>
-              <div class="mb-2 flex justify-between">
-                <label class="text-sm font-medium text-foreground">透明度</label>
-                <span class="text-sm text-primary">{{ opacity }}%</span>
-              </div>
-              <a-slider v-model:value="opacity" :disabled="batchProcessing" :min="5" :max="100" aria-label-for-handle="透明度" />
-            </div>
-
-            <div>
-              <div class="mb-2 flex justify-between">
-                <label class="text-sm font-medium text-foreground">旋转角度</label>
-                <span class="text-sm text-primary">{{ rotation }}°</span>
-              </div>
-              <a-slider v-model:value="rotation" :disabled="batchProcessing" :min="-90" :max="90" aria-label-for-handle="旋转角度" />
-            </div>
-
-            <a-divider />
-
-            <a-checkbox v-model:checked="repeat" :disabled="batchProcessing"> 开启全屏平铺水印 </a-checkbox>
-
-            <Transition name="settings">
-              <div v-if="!repeat">
-                <label class="mb-2 block text-sm font-medium text-foreground">水印位置</label>
-                <a-select
-                  v-model:value="position"
-                  :disabled="batchProcessing"
-                  aria-label="水印位置"
-                  class="w-full"
-                  :options="[
-                    { label: '左上角', value: 'left-top' },
-                    { label: '居中', value: 'center' },
-                    { label: '右下角', value: 'right-bottom' },
-                  ]"
-                />
-              </div>
-            </Transition>
-
-            <a-divider />
-
-            <a-button
-              class="settings-download"
-              type="primary"
-              block
-              size="large"
-              :disabled="!hasImages || (images.length === 1 && !canvasRef) || batchProcessing"
-              :loading="batchProcessing"
-              @click="images.length > 1 ? downloadBatchZip() : downloadSingle()"
-            >
-              {{ batchProcessing ? (exportStage === 'packing' ? '正在打包 ZIP…' : `处理中 ${batchProgress}/${batchTotal}`) : images.length > 1 ? `批量下载 ZIP (${images.length} 张)` : '导出' }}
-            </a-button>
-
-            <p class="text-center text-xs text-muted-foreground">
-              图片在浏览器本地处理，不会上传服务器
-            </p>
           </fieldset>
-        </a-card>
-      </a-col>
-    </a-row>
+        </div>
+        <footer class="settings-footer"><span class="footer-dot"></span>所有调整实时预览 · 原尺寸导出</footer>
+      </aside>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.editor-card {
-  border-color: var(--border);
-  box-shadow: 0 4px 24px #24263b03;
-}
-
-.settings-fields {
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.upload-area {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  border-color: #d9d5ed;
-  background: linear-gradient(155deg, #faf9ff, #f6f7fb 70%);
-  transition: border-color 200ms, box-shadow 200ms;
-}
-
-.upload-area::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background: radial-gradient(350px circle at var(--spot-x, 50%) var(--spot-y, 45%), #c3b5ff55, transparent 80%);
-  opacity: 0;
-  transition: opacity 250ms;
-}
-
-.upload-area:focus-within,
-.upload-area.is-file-dragging {
-  border-color: var(--primary);
-  box-shadow: inset 0 0 0 1px var(--primary);
-}
-
-.upload-area:focus-within::before,
-.upload-area.is-file-dragging::before {
-  opacity: 1;
-}
-
-.upload-art {
-  position: relative;
-  width: 94px;
-  height: 86px;
-  margin-bottom: 24px;
-  pointer-events: none;
-  transition: transform 300ms cubic-bezier(.2, .8, .2, 1);
-}
-
-.upload-art-back,
-.upload-art-front {
-  position: absolute;
-  display: grid;
-  place-items: center;
-  width: 70px;
-  height: 72px;
-  border: 1px solid #dcd5fa;
-  border-radius: 15px;
-}
-
-.upload-art-back {
-  top: 4px;
-  left: 3px;
-  background: #eae5ff;
-  transform: rotate(-13deg);
-}
-
-.upload-art-front {
-  top: 8px;
-  left: 17px;
-  color: var(--primary);
-  background: #fff;
-  transform: rotate(6deg);
-  box-shadow: 0 8px 20px #6558d912;
-}
-
-.upload-art-plus {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  border: 3px solid #f8f7fd;
-  border-radius: 50%;
-  color: white;
-  background: var(--primary);
-  font-size: 21px;
-  line-height: 1;
-}
-
-.upload-area.is-file-dragging .upload-art {
-  transform: translateY(-6px) rotate(-4deg);
-}
-
-.upload-button {
-  min-width: 140px;
-  box-shadow: 0 4px 12px #6558d926;
-}
-
-.upload-formats {
-  margin-top: 16px;
-  margin-bottom: 0;
-  letter-spacing: .2px;
-}
-
-.upload-privacy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-}
-
-.watermark-type {
-  position: relative;
-  padding: 4px;
-  border-radius: 11px;
-  background: var(--muted);
-}
-
-.type-indicator {
-  position: absolute;
-  inset: 4px auto 4px 4px;
-  width: calc((100% - 8px) / 2);
-  border: 1px solid #e5e1f7;
-  border-radius: 8px;
-  background: white;
-  box-shadow: 0 2px 5px #24263b09;
-  transition: transform 320ms cubic-bezier(.22, 1.25, .36, 1);
-}
-
-.watermark-type.is-logo .type-indicator {
-  transform: translateX(100%);
-}
-
-.watermark-type :deep(.ant-radio-group) {
-  position: relative;
-  display: flex;
-}
-
-.watermark-type :deep(.ant-radio-button-wrapper) {
-  height: 36px;
-  padding-inline: 8px;
-  border: 0 !important;
-  border-radius: 8px;
-  color: var(--muted-foreground);
-  background: transparent !important;
-  box-shadow: none !important;
-  line-height: 36px;
-  transition: color 200ms;
-}
-
-.watermark-type :deep(.ant-radio-button-wrapper::before) {
-  display: none;
-}
-
-.watermark-type :deep(.ant-radio-button-wrapper-checked) {
-  color: var(--primary);
-  font-weight: 600;
-}
-
-.watermark-type :deep(.ant-radio-button-wrapper:has(input:focus-visible)) {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
-
-.watermark-type:has(input:disabled) {
-  opacity: .55;
-}
-
-.export-status {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border: 1px solid #e5e1f7;
-  border-radius: 12px;
-  color: var(--primary);
-  background: #f2f0ff;
-}
-
-.export-status--done {
-  border-color: #d4e9df;
-  color: #27815b;
-  background: #f0f8f4;
-}
-
-.export-status--error {
-  border-color: #f1d4d4;
-  color: #bd3e3e;
-  background: #fff4f4;
-}
-
-.status-mark {
-  flex: none;
-  width: 24px;
-  height: 24px;
-}
-
-.status-spinner {
-  transform-origin: center;
-  stroke-dasharray: 35 16;
-  animation: status-spin 1s linear infinite;
-}
-
-.status-check {
-  stroke-dasharray: 24;
-  stroke-dashoffset: 0;
-  animation: status-draw 300ms ease-out;
-}
-
-.content-enter-active,
-.content-leave-active,
-.settings-enter-active,
-.settings-leave-active {
-  transition: opacity 160ms ease, transform 160ms ease;
-}
-
-.content-enter-from,
-.content-leave-to,
-.settings-enter-from,
-.settings-leave-to {
-  opacity: 0;
-  transform: translateY(5px);
-}
-
-@keyframes status-spin {
-  to { transform: rotate(360deg); }
-}
-
-@keyframes status-draw {
-  from { stroke-dashoffset: 24; }
-}
-
+.image-editor { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.workspace-toolbar { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 18px; }
+.workspace-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; }
+.workspace-heading h1 { margin: 0; font-size: 23px; font-weight: 700; letter-spacing: -.6px; }
+.workspace-subtitle { color: var(--muted-foreground); font-size: 12px; }
+.toolbar-actions, .export-actions { display: flex; align-items: center; gap: 8px; }
+.toolbar-actions :deep(.ant-btn) { height: 38px; padding-inline: 16px; font-size: 13px; }
+.editor-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; flex: 1; min-height: 0; gap: 20px; }
+.preview-panel, .settings-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 16px; background: white; box-shadow: 0 4px 18px #24263b03; }
+.panel-header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; min-height: 58px; padding: 0 20px; border-bottom: 1px solid #eff0f6; }
+.panel-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.panel-heading h2 { margin: 0; font-size: 14px; font-weight: 600; white-space: nowrap; }
+.panel-subtitle { color: #999cac; font-size: 11px; }
+.live-label { display: flex; align-items: center; gap: 5px; color: #85899c; font-size: 10px; }
+.live-label i { width: 5px; height: 5px; border-radius: 50%; background: #6db394; }
+.image-counter { color: var(--foreground); font-size: 12px; font-variant-numeric: tabular-nums; }
+.image-counter span { color: #a1a3b1; }
+.section-link { display: none; color: var(--primary); font-size: 12px; }
+.preview-body { display: flex; flex: 1; min-height: 0; padding: 16px; }
+.preview-content { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; gap: 12px; }
+.image-meta { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; color: #9598a8; font-size: 11px; }
+.image-filename { overflow: hidden; color: #74788e; text-overflow: ellipsis; white-space: nowrap; }
+.image-meta > span:last-child { flex: none; font-variant-numeric: tabular-nums; }
+.preview-stage { display: flex; flex: 1; align-items: center; justify-content: center; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #eeeff5; border-radius: 12px; background-color: #f6f7fb; background-image: radial-gradient(#dfe1ed .7px, transparent .7px); background-size: 12px 12px; padding: 16px; }
+.preview-canvas { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 3px 16px #25263b0d; }
+.preview-caption { display: flex; flex: none; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; min-height: 20px; color: #8d90a2; font-size: 11px; }
+.scope-caption { color: #8a80ba; }
+.touch-drag-toggle { display: none; }
+.image-library { flex: none; padding: 10px 16px 14px; border-top: 1px solid #eff0f6; }
+.library-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; color: #7c8093; font-size: 11px; }
+.library-header b { margin-left: 4px; color: var(--foreground); font-weight: 500; }
+.library-actions { display: flex; gap: 2px; }
+.library-actions :deep(.ant-btn) { height: 24px; padding-inline: 7px; color: #8c8fa1; font-size: 11px; }
+.library-actions :deep(.ant-btn-dangerous) { color: #bd6b75; }
+.thumbnail-strip { display: flex; gap: 10px; overflow-x: auto; padding: 3px; margin: -3px; overscroll-behavior-x: contain; scrollbar-width: thin; }
+.thumbnail-button { flex: none; width: 82px; padding: 4px; border: 1px solid transparent; border-radius: 9px; color: #9295a4; background: transparent; text-align: left; transition: border-color 180ms, background 180ms, transform 180ms; }
+.thumbnail-button:hover { background: var(--muted); }
+.thumbnail-button.is-selected { border-color: #c7bff3; color: var(--primary); background: #f3f0ff; }
+.thumbnail-image { display: block; position: relative; overflow: hidden; height: 48px; border-radius: 5px; background: #eff0f6; }
+.thumbnail-image img { width: 100%; height: 100%; object-fit: cover; }
+.thumbnail-number, .thumbnail-custom { position: absolute; bottom: 0; padding: 0 4px; font-size: 9px; line-height: 15px; }
+.thumbnail-number { left: 0; border-top-right-radius: 4px; color: white; background: #24263b66; }
+.thumbnail-custom { right: 0; border-top-left-radius: 4px; color: white; background: #6558d9dd; }
+.thumbnail-name { display: block; overflow: hidden; margin-top: 5px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.thumbnail-add { display: flex; flex: none; align-items: center; justify-content: center; flex-direction: column; gap: 4px; width: 76px; min-height: 72px; border: 1px dashed #dadce8; border-radius: 9px; background: white; color: #989aac; font-size: 10px; transition: color 180ms, border-color 180ms; }
+.thumbnail-add > span { font-size: 22px; line-height: 1; }
+.thumbnail-add:hover { border-color: var(--primary); color: var(--primary); }
+.settings-scope { flex: none; padding: 16px 20px 12px; }
+.scope-heading { display: flex; align-items: center; justify-content: space-between; color: #8a8d9f; font-size: 11px; }
+.scope-badge { padding: 2px 7px; border-radius: 5px; color: #7c7f92; background: #f1f2f7; font-size: 10px; }
+.scope-badge.is-custom { color: var(--primary); background: var(--accent); }
+.scope-controls { display: flex; align-items: center; justify-content: space-between; gap: 4px; margin-top: 10px; }
+.scope-controls :deep(.ant-checkbox-wrapper) { font-size: 12px; }
+.scope-controls :deep(.ant-btn) { height: 24px; padding: 0; font-size: 11px; }
+.scope-note { overflow: hidden; margin: 7px 0 0; color: #9a9dad; font-size: 10px; line-height: 1.6; text-overflow: ellipsis; white-space: nowrap; }
+.settings-navigation { flex: none; padding: 0 20px 16px; border-bottom: 1px solid #eff0f6; }
+.settings-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 20px; scrollbar-width: thin; scrollbar-color: #dddbe9 transparent; }
+.settings-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.settings-page { display: flex; flex-direction: column; gap: 22px; }
+.setting-section-title h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.setting-section-title p { margin: 5px 0 0; color: #9396a7; font-size: 11px; line-height: 1.6; }
+.setting-field { display: flex; flex-direction: column; gap: 10px; }
+.setting-field label { color: #64697f; font-size: 12px; font-weight: 500; }
+.field-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.field-heading output { padding: 3px 7px; border: 1px solid #eeeaf9; border-radius: 5px; color: var(--primary); background: #faf9ff; font-size: 12px; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.field-heading output small { margin-left: 3px; color: #a39bc7; font-size: 10px; }
+.setting-field :deep(.ant-slider) { margin: 1px 5px 0; }
+.field-note { margin: 0; color: #9b9eae; font-size: 11px; line-height: 1.7; }
+.content-fields .field-note { margin-top: 12px; }
+.setting-field :deep(.ant-input-textarea-show-count::after) { margin-top: 5px; color: #a8aaba; font-size: 10px; }
+.setting-field :deep(textarea.ant-input) { padding: 12px; font-size: 13px; line-height: 1.8; resize: vertical; }
+.range-labels { display: flex; justify-content: space-between; margin-top: -5px; color: #aaadbc; font-size: 10px; }
+.color-custom { display: flex; align-items: center; gap: 10px; height: 40px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 8px; }
+.color-options { display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 10px; }
+.color-custom input { width: 27px; height: 27px; padding: 0; overflow: hidden; border: 1px solid #e2e3ec; border-radius: 5px; cursor: pointer; }
+.color-custom > span { color: #8d90a2; font-size: 11px; font-variant-numeric: tabular-nums; }
+.color-presets { display: flex; gap: 3px; }
+.color-presets button { display: grid; place-items: center; flex: 1; height: 34px; max-width: 40px; padding: 3px; border: 1px solid transparent; border-radius: 50%; background: transparent; transition: border-color 160ms, transform 160ms; }
+.color-presets button span { width: 19px; height: 19px; border: 1px solid #24263b16; border-radius: 50%; background: var(--swatch-color); }
+.color-presets button.is-selected { border-color: var(--primary); }
+.color-presets button:hover { transform: translateY(-2px); }
+.logo-upload { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; min-height: 170px; padding: 20px 10px; border: 1px dashed #d9d5ed; border-radius: 12px; color: var(--primary); background: #faf9ff; transition: border-color 180ms, background 180ms; }
+.logo-upload:hover { border-color: var(--primary); background: var(--accent); }
+.logo-upload > span { color: #74788e; font-size: 13px; }
+.logo-upload small { color: #a2a4b4; font-size: 10px; }
+.logo-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.logo-summary > img { width: 44px; height: 44px; object-fit: contain; }
+.logo-summary > div { flex: 1; min-width: 80px; }
+.logo-summary strong, .logo-summary > div > span { display: block; font-size: 11px; }
+.logo-summary strong { font-weight: 500; }
+.logo-summary > div > span { margin-top: 4px; color: #a3a5b4; }
+.settings-footer { display: flex; flex: none; align-items: center; justify-content: center; gap: 6px; min-height: 42px; border-top: 1px solid #eff0f6; color: #a3a5b5; font-size: 10px; }
+.footer-dot { width: 4px; height: 4px; border-radius: 50%; background: #b5addb; }
+.watermark-type { position: relative; padding: 4px; border-radius: 10px; background: #f3f3f9; }
+.type-indicator { position: absolute; inset: 4px auto 4px 4px; width: calc((100% - 8px) / var(--segment-count, 2)); border: 1px solid #e9e5f6; border-radius: 7px; background: white; box-shadow: 0 2px 5px #24263b07; transform: translateX(calc(var(--active-index, 0) * 100%)); transition: transform 320ms cubic-bezier(.22, 1.25, .36, 1), opacity 160ms; }
+.watermark-type :deep(.ant-radio-group) { display: flex; position: relative; width: 100%; }
+.watermark-type :deep(.ant-radio-button-wrapper) { display: flex; flex: 1; align-items: center; justify-content: center; min-width: 0; height: 36px; padding-inline: 5px; border: 0 !important; border-radius: 7px; color: #8b8da2; background: transparent !important; box-shadow: none !important; font-size: 12px; line-height: normal; text-align: center; transition: color 180ms; }
+.watermark-type :deep(.ant-radio-button-wrapper::before) { display: none; }
+.watermark-type :deep(.ant-radio-button-wrapper-checked) { color: var(--primary); font-weight: 600; }
+.watermark-type :deep(.ant-radio-button-wrapper:has(input:focus-visible)) { outline: 2px solid var(--ring); outline-offset: 2px; }
+.watermark-type:has(input:disabled) { opacity: .55; }
+.settings-tabs :deep(.ant-radio-button-wrapper) { height: 32px; }
+.layout-toggle :deep(.ant-radio-button-wrapper) { height: 44px; }
+.layout-option { display: inline-flex; align-items: center; justify-content: center; gap: 7px; line-height: 1.3; transition: transform 160ms; }
+.watermark-type :deep(.ant-radio-button-wrapper:active) .layout-option { transform: scale(.96); }
+.position-options :deep(.ant-radio-button-wrapper) { height: 72px; }
+.position-options .layout-option { flex-direction: column; gap: 5px; }
+.position-reveal { display: grid; grid-template-rows: 1fr; transition: grid-template-rows 240ms, opacity 180ms; }
+.position-panel { min-height: 0; overflow: hidden; }
+.layout-options-enter-from, .layout-options-leave-to { grid-template-rows: 0fr; opacity: 0; }
+.upload-area { display: flex; flex: 1; position: relative; align-items: center; justify-content: center; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; isolation: isolate; padding: 24px; border: 1px dashed #dcd8ee; border-radius: 12px; background: linear-gradient(155deg, #fbfaff, #f8f9fc 70%); text-align: center; cursor: pointer; transition: border-color 200ms, box-shadow 200ms; }
+.upload-area::before { content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none; background: radial-gradient(350px circle at var(--spot-x, 50%) var(--spot-y, 45%), #c3b5ff44, transparent 80%); opacity: 0; transition: opacity 250ms; }
+.upload-area:focus-within, .upload-area.is-file-dragging { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+.upload-area:focus-within::before, .upload-area.is-file-dragging::before { opacity: 1; }
+.upload-art { position: relative; width: 94px; height: 86px; margin-bottom: 28px; pointer-events: none; transition: transform 300ms cubic-bezier(.2,.8,.2,1); }
+.upload-art-back, .upload-art-front { display: grid; position: absolute; place-items: center; width: 70px; height: 72px; border: 1px solid #dcd5fa; border-radius: 15px; }
+.upload-art-back { top: 4px; left: 3px; background: #eae5ff; transform: rotate(-13deg); }
+.upload-art-front { top: 8px; left: 17px; color: var(--primary); background: white; transform: rotate(6deg); box-shadow: 0 8px 20px #6558d912; }
+.upload-art-plus { display: grid; position: absolute; right: 0; bottom: 0; place-items: center; width: 28px; height: 28px; border: 3px solid #f8f7fd; border-radius: 50%; color: white; background: var(--primary); font-size: 21px; line-height: 1; }
+.upload-eyebrow { margin-bottom: 8px; color: #a19bb9; font-size: 11px; }
+.upload-area h3 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.3px; }
+.upload-area > p { margin: 10px 0 0; color: #9295a8; font-size: 12px; }
+.upload-button { min-width: 142px; margin-top: 24px; box-shadow: 0 4px 12px #6558d926; }
+.upload-formats { margin-top: 16px; color: #a8a9b8; font-size: 10px; letter-spacing: .2px; }
+.upload-privacy { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 32px; color: #a4a7b5; font-size: 10px; }
+.upload-area.is-file-dragging .upload-art { transform: translateY(-6px) rotate(-4deg); }
+.export-status { display: flex; flex: none; align-items: center; gap: 10px; margin-bottom: 14px; padding: 9px 14px; border: 1px solid #e5e1f7; border-radius: 10px; color: var(--primary); background: #f2f0ff; }
+.export-status--done { border-color: #d4e9df; color: #27815b; background: #f0f8f4; }
+.export-status--error { border-color: #f1d4d4; color: #bd3e3e; background: #fff4f4; }
+.status-content { flex: 1; min-width: 0; font-size: 12px; }
+.status-mark { flex: none; width: 20px; height: 20px; }
+.status-spinner { transform-origin: center; stroke-dasharray: 35 16; animation: status-spin 1s linear infinite; }
+.status-check { stroke-dasharray: 24; animation: status-draw 300ms ease-out; }
+.content-enter-active, .content-leave-active, .settings-enter-active, .settings-leave-active { transition: opacity 160ms, transform 160ms; }
+.content-enter-from, .content-leave-to, .settings-enter-from, .settings-leave-to { opacity: 0; transform: translateY(5px); }
+@keyframes status-spin { to { transform: rotate(360deg); } }
+@keyframes status-draw { from { stroke-dashoffset: 24; } }
 @media (hover: hover) and (pointer: fine) {
-  .upload-area:hover {
-    border-color: #a499e7;
-  }
-
-  .upload-area:hover::before {
-    opacity: 1;
-  }
-
-  .upload-area:hover .upload-art {
-    transform: translateY(-4px);
-  }
+  .upload-area:hover { border-color: #a499e7; }
+  .upload-area:hover::before { opacity: 1; }
+  .upload-area:hover .upload-art { transform: translateY(-4px); }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .upload-area,
-  .upload-area::before,
-  .upload-art,
-  .type-indicator,
-  .content-enter-active,
-  .content-leave-active,
-  .settings-enter-active,
-  .settings-leave-active {
-    transition: none;
-  }
-
-  .status-spinner,
-  .status-check,
-  .image-editor :deep(.ant-progress-bg),
-  .image-editor :deep(.ant-progress-bg::before) {
-    animation: none !important;
-    transition: none !important;
-  }
-
-  .content-enter-from,
-  .content-leave-to,
-  .settings-enter-from,
-  .settings-leave-to {
-    transform: none;
-  }
-}
-
-.touch-drag-toggle {
-  display: none;
-}
-
-.editor-card {
-  scroll-margin-top: 12px;
-}
-
-.section-link {
-  align-items: center;
-  min-height: 44px;
-  font-size: 14px;
-  font-weight: normal;
-}
-
-@media (any-pointer: coarse), (max-width: 1023px) {
-  .touch-drag-toggle {
-    display: inline-flex;
-  }
-
-  .thumbnail-remove {
-    position: static;
-    width: 100%;
-    height: 44px;
-    margin-top: 4px;
-    border-radius: 6px;
-    font-size: 20px;
-  }
-}
-
+@media (any-pointer: coarse) { .touch-drag-toggle { display: inline-flex; } }
+@media (min-width: 1440px) { .editor-workspace { grid-template-columns: minmax(0, 1fr) 380px; gap: 24px; } }
 @media (max-width: 1023px) {
-  .image-editor :deep(.ant-card-head) {
-    min-height: 52px;
-    padding-inline: 16px;
-  }
-
-  .image-editor :deep(.ant-card-body) {
-    padding: 16px;
-  }
-
-  .image-editor :deep(.ant-btn) {
-    min-height: 44px;
-    height: auto;
-  }
-
-  .image-editor :deep(.ant-radio-button-wrapper) {
-    height: 44px;
-    line-height: 42px;
-  }
-
-  .image-editor :deep(.ant-input),
-  .image-editor :deep(.ant-select-selection-search-input) {
-    font-size: 16px;
-  }
-
-  .image-editor :deep(.ant-select-selector) {
-    min-height: 44px;
-    align-items: center;
-  }
-
-  .image-editor :deep(.ant-checkbox-wrapper) {
-    min-height: 44px;
-    align-items: center;
-  }
-
-  .image-editor :deep(.ant-slider-horizontal) {
-    height: 44px;
-    padding-block: 20px;
-    margin: 0 12px;
-  }
-
-  .image-editor :deep(.ant-slider-handle) {
-    top: 17px;
-  }
-
-  .image-editor :deep(.ant-slider-handle::before) {
-    width: 44px;
-    height: 44px;
-    top: -17px;
-    left: -17px;
-  }
-
-  .export-actions {
-    position: fixed;
-    inset: auto 0 0;
-    z-index: 20;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
-    padding: 12px max(12px, env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
-    border-top: 1px solid var(--border);
-    background: var(--card);
-    box-shadow: 0 -4px 16px rgb(0 0 0 / 0.04);
-  }
-
-  .export-actions :deep(.ant-btn) {
-    min-width: 0;
-    padding-inline: 8px;
-  }
-
-  .export-actions.single-export {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .preview-canvas {
-    width: auto;
-    height: auto;
-    max-height: 45dvh;
-  }
-
-  .section-link {
-    display: inline-flex;
-  }
-
-  .thumbnail-strip {
-    overscroll-behavior-x: contain;
-  }
-
-  .color-presets {
-    flex-basis: 100%;
-  }
-
-  .settings-download {
-    display: none;
-  }
+  .image-editor { height: auto; }
+  .workspace-toolbar { align-items: center; padding-bottom: 16px; gap: 10px; }
+  .workspace-heading { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .workspace-heading h1 { font-size: 21px; }
+  .workspace-subtitle { font-size: 11px; }
+  .toolbar-actions .import-action { padding-inline: 12px; height: 40px; }
+  .editor-workspace { display: flex; flex-direction: column; gap: 16px; }
+  .preview-panel, .settings-panel { overflow: hidden; border-radius: 14px; }
+  .panel-header { min-height: 54px; padding-inline: 16px; }
+  .panel-heading { gap: 7px; }
+  .live-label { font-size: 9px; }
+  .image-counter { display: none; }
+  .section-link { display: inline-flex; align-items: center; min-height: 44px; }
+  .preview-body { padding: 12px; }
+  .preview-content { gap: 10px; }
+  .image-meta { flex-wrap: wrap; gap: 4px 10px; }
+  .image-filename { flex: 1; min-width: 0; }
+  .preview-stage { flex: auto; height: 38dvh; min-height: 180px; max-height: 360px; padding: 10px; }
+  .preview-caption { font-size: 10px; }
+  .scope-caption { display: none; }
+  .touch-drag-toggle { display: inline-flex; }
+  .preview-caption :deep(.ant-btn) { min-height: 36px; font-size: 11px; }
+  .image-library { padding: 8px 12px 12px; }
+  .library-actions :deep(.ant-btn) { min-height: 40px; padding-inline: 8px; }
+  .settings-scope { padding-inline: 16px; }
+  .scope-controls { min-height: 40px; }
+  .scope-controls :deep(.ant-checkbox-wrapper) { display: flex; align-items: center; min-height: 44px; font-size: 13px; }
+  .scope-controls :deep(.ant-btn) { min-height: 44px; font-size: 11px; }
+  .scope-note { font-size: 11px; }
+  .settings-navigation { padding: 0 16px 16px; }
+  .settings-scroll { overflow: visible; padding: 20px 16px 24px; }
+  .settings-page { gap: 22px; }
+  .setting-field :deep(textarea.ant-input) { font-size: 16px; }
+  .watermark-type :deep(.ant-radio-button-wrapper) { min-height: 44px; font-size: 13px; }
+  .position-options :deep(.ant-radio-button-wrapper) { min-height: 72px; }
+  .color-presets { gap: 7px; }
+  .color-options { display: flex; flex-direction: column; align-items: stretch; }
+  .color-presets button { height: 44px; max-width: 44px; }
+  .color-presets button span { width: 26px; height: 26px; }
+  .color-custom { height: 44px; }
+  .setting-field :deep(.ant-slider-horizontal) { height: 38px; padding-block: 17px; margin-top: -7px; }
+  .setting-field :deep(.ant-slider-handle) { top: 14px; }
+  .setting-field :deep(.ant-slider-handle::before) { width: 44px; height: 44px; top: -17px; left: -17px; }
+  .range-labels { margin-top: -12px; }
+  .upload-area { flex: auto; min-height: 340px; padding: 30px 16px; }
+  .upload-art { margin-bottom: 20px; }
+  .upload-area h3 { font-size: 20px; }
+  .upload-area > p { font-size: 11px; }
+  .upload-button { height: 44px; }
+  .upload-privacy { margin-top: 24px; }
+  .export-actions { position: fixed; inset: auto 0 0; z-index: 20; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); padding: 12px max(12px, env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); border-top: 1px solid var(--border); background: white; box-shadow: 0 -4px 16px #24263b04; }
+  .export-actions.single-export { grid-template-columns: minmax(0, 1fr); }
+  .export-actions :deep(.ant-btn) { min-width: 0; height: 44px; padding-inline: 8px; font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+  .image-editor :deep(.ant-progress-bg), .image-editor :deep(.ant-progress-bg::before) { transition: none !important; animation: none !important; }
+  .content-enter-from, .content-leave-to, .settings-enter-from, .settings-leave-to, .watermark-type :deep(.ant-radio-button-wrapper:active) .layout-option { transform: none; }
 }
 </style>

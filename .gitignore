@@ -1,4 +1,4 @@
-# Logs
+# 日志
 logs
 *.log
 npm-debug.log*
@@ -12,10 +12,10 @@ dist
 dist-ssr
 *.local
 
-# Local verification script
+# 本地验证脚本
 /scripts/check-editor.cjs
 
-# Editor directories and files
+# 编辑器目录和文件
 .vscode/*
 !.vscode/extensions.json
 .idea
