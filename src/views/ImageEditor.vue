@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch, nextTick } from "vue";
 import { message } from "ant-design-vue";
-import JSZip from "jszip";
 
 const fileInput = ref<HTMLInputElement>();
 const logoInput = ref<HTMLInputElement>();
@@ -514,6 +513,7 @@ async function downloadBatchZip() {
   batchTotal.value = items.length;
 
   try {
+    const { default: JSZip } = await import("jszip");
     const zip = new JSZip();
     const offscreen = document.createElement("canvas");
     const ctx = offscreen.getContext("2d");
