@@ -5,14 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc -b && vite build",
+    "test": "node scripts/check-editor.cjs",
+    "build": "npm run test && vue-tsc -b && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.5",
     "ant-design-vue": "^4.2.6",
     "jszip": "^3.10.2",
-    "motion-v": "^2.12.0",
     "tailwindcss": "^4.3.5",
     "vue": "^3.5.44"
   },

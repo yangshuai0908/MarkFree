@@ -12,8 +12,6 @@ dist
 dist-ssr
 *.local
 
-# 本地验证脚本
-/scripts/check-editor.cjs
 
 # 编辑器目录和文件
 .vscode/*

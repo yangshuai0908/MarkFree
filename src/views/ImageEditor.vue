@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch, nextTick } from "vue";
 import { message } from "ant-design-vue";
+import type {
+  ImageItem,
+  WatermarkSettings,
+  ExportFormat,
+} from "../types/watermark";
+import {
+  applyWatermark as canvasApplyWatermark,
+  canvasToBlob as utilsCanvasToBlob,
+  getPosition as calcPosition,
+} from "../utils/canvas";
 
 const fileInput = ref<HTMLInputElement>();
 const logoInput = ref<HTMLInputElement>();
@@ -14,57 +24,98 @@ const settingsTabs = [
 const settingsTabIndex = computed(() =>
   settingsTabs.findIndex((tab) => tab.value === settingsTab.value),
 );
+const zoomMode = ref<"fit" | "actual">("fit");
 
-// ── Batch image list ──
-interface ImageItem {
-  id: number;
-  url: string;
-  img: HTMLImageElement;
-  name: string;
-  watermark?: WatermarkSettings;
+const STORAGE_KEY = "markfree_watermark_settings";
+
+function loadStoredSettings(): Partial<WatermarkSettings> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    delete parsed.logoImage;
+    delete parsed.logoUrl;
+    return parsed;
+  } catch {
+    return {};
+  }
 }
 
-interface WatermarkSettings {
-  watermarkType: "text" | "logo";
-  watermarkText: string;
-  includeDate: boolean;
-  watermarkDate: string;
-  watermarkColor: string;
-  fontSize: number;
-  logoUrl: string;
-  logoImage: HTMLImageElement | null;
-  logoScale: number;
-  opacity: number;
-  rotation: number;
-  repeat: boolean;
-  position: string;
-  offsetX: number;
-  offsetY: number;
+function saveStoredSettings(settings: WatermarkSettings) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    const toSave: Record<string, any> = {};
+    for (const [k, v] of Object.entries(settings)) {
+      if (k !== "logoImage" && k !== "logoUrl") {
+        toSave[k] = v;
+      }
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+  } catch {
+    // 忽略存储配额/无痕浏览错误
+  }
 }
 
-let nextId = 0;
-const images = ref<ImageItem[]>([]);
-const activeIndex = ref(0);
-const activeItem = computed(() => images.value[activeIndex.value] ?? null);
-
-// Images inherit the shared settings until an independent snapshot is created.
-const sharedSettings = ref<WatermarkSettings>({
+const defaultSharedSettings: WatermarkSettings = {
   watermarkType: "text",
   watermarkText: "仅供个人使用 · MarkFree",
   includeDate: false,
   watermarkDate: getTodayDate(),
   watermarkColor: "#ffffff",
   fontSize: 48,
+  fontFamily: "Arial, sans-serif",
+  adaptiveFont: false,
   logoUrl: "",
   logoImage: null,
   logoScale: 20,
   opacity: 35,
   rotation: -30,
   repeat: true,
+  stagger: false,
   position: "right-bottom",
   offsetX: 0.8,
   offsetY: 0.85,
+  tileSpacing: 100,
+};
+
+let nextId = 0;
+const images = ref<ImageItem[]>([]);
+const activeIndex = ref(0);
+const activeItem = computed(() => images.value[activeIndex.value] ?? null);
+
+// 在创建独立快照之前，镜像会沿用共享设置。
+const storedSettings = loadStoredSettings();
+const sharedSettings = ref<WatermarkSettings>({
+  ...defaultSharedSettings,
+  ...storedSettings,
+  watermarkDate: storedSettings.watermarkDate || getTodayDate(),
+  logoImage: null,
+  logoUrl: "",
 });
+
+watch(
+  sharedSettings,
+  (val) => {
+    saveStoredSettings(val);
+  },
+  { deep: true },
+);
+
+function resetSharedSettings() {
+  if (batchProcessing.value) return;
+  sharedSettings.value = {
+    ...defaultSharedSettings,
+    watermarkDate: getTodayDate(),
+  };
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {}
+  }
+  renderCanvas();
+  message.success("已恢复统一设置默认值");
+}
 
 function getWatermark(item: ImageItem) {
   return item.watermark ?? sharedSettings.value;
@@ -74,7 +125,7 @@ const currentSettings = computed(() =>
   activeItem.value ? getWatermark(activeItem.value) : sharedSettings.value,
 );
 
-// Keep the existing controls bound directly to the selected settings, without copying form state.
+// 保持现有控件与所选设置之间的直接绑定，无需复制表单状态。
 function setting<K extends keyof WatermarkSettings>(key: K) {
   return computed({
     get: () => currentSettings.value[key],
@@ -98,6 +149,17 @@ const rotation = setting("rotation");
 const repeat = setting("repeat");
 const offsetX = setting("offsetX");
 const offsetY = setting("offsetY");
+const tileSpacing = setting("tileSpacing");
+const adaptiveFont = setting("adaptiveFont");
+const fontFamily = setting("fontFamily");
+const stagger = setting("stagger");
+
+const fontOptions = [
+  { label: "无衬线黑体 (现代默认)", value: "Arial, sans-serif" },
+  { label: "严肃宋体 (合同证件)", value: "'SimSun', 'Songti SC', serif" },
+  { label: "标准楷体 (公文证书)", value: "'KaiTi', 'STKaiti', serif" },
+  { label: "防伪等宽 (序列编号)", value: "'Courier New', Consolas, monospace" },
+];
 const positionOptions = [
   { label: "左上角", value: "left-top", x: 0.15, y: 0.1 },
   { label: "居中", value: "center", x: 0.5, y: 0.5 },
@@ -115,7 +177,7 @@ const position = computed({
     settings.offsetY = preset.y;
   },
 });
-// Dragging can move the watermark away from its last preset.
+// 通过拖拽，可将水印从其上一个预设位置移开。
 const selectedPositionIndex = computed(() =>
   positionOptions.findIndex(
     (option) =>
@@ -177,11 +239,13 @@ let dragStartY = 0;
 let startOffsetX = 0;
 let startOffsetY = 0;
 
-// Export state covers image rendering and ZIP compression separately.
+// 导出状态分别涵盖图像渲染和 ZIP 压缩。
 const exportStage = ref<"idle" | "rendering" | "packing" | "done" | "error">(
   "idle",
 );
 const exportKind = ref<"single" | "zip">("zip");
+const exportFormat = ref<"png" | "jpeg" | "webp">("png");
+const exportQuality = ref<number>(90);
 const batchProcessing = computed(
   () => exportStage.value === "rendering" || exportStage.value === "packing",
 );
@@ -218,7 +282,7 @@ const exportLabel = computed(() => {
 const hasImages = computed(() => images.value.length > 0);
 const hasLogo = computed(() => !!logoImage.value);
 
-// ── File handling ──
+// ── 文件处理 ──
 function selectImage() {
   if (batchProcessing.value) return;
   fileInput.value?.click();
@@ -281,7 +345,7 @@ async function handleFileChange(event: Event) {
   }
 
   if (loaded > 0) {
-    // Switch to last added image if nothing was selected before
+    // 如果之前未选中任何内容，则切换至最后添加的图像
     if (images.value.length === loaded) {
       activeIndex.value = 0;
     }
@@ -390,7 +454,7 @@ function handleDrop(event: DragEvent) {
   if (batchProcessing.value) return;
   const files = Array.from(event.dataTransfer?.files ?? []);
   if (files.length > 0) {
-    // Simulate file input
+    // 模拟文件输入
     const dt = new DataTransfer();
     files.forEach((f) => dt.items.add(f));
     if (fileInput.value) {
@@ -400,25 +464,34 @@ function handleDrop(event: DragEvent) {
   }
 }
 
-// ── Render (shared for preview and batch) ──
+// ── 渲染（用于预览及批量处理） ──
+let rafHandle: number | null = null;
+
+function scheduleRenderCanvas() {
+  if (typeof requestAnimationFrame === "function") {
+    if (rafHandle !== null) return;
+    rafHandle = requestAnimationFrame(() => {
+      rafHandle = null;
+      renderCanvas();
+    });
+  } else {
+    renderCanvas();
+  }
+}
+
 function applyWatermark(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
   settings: WatermarkSettings,
 ) {
-  ctx.save();
-  ctx.globalAlpha = settings.opacity / 100;
-
-  if (settings.watermarkType === "text") {
-    renderTextWatermark(ctx, canvas, settings);
-  } else {
-    renderLogoWatermark(ctx, canvas, settings);
-  }
-
-  ctx.restore();
+  canvasApplyWatermark(ctx, canvas, settings);
 }
 
 function renderCanvas() {
+  if (rafHandle !== null && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(rafHandle);
+    rafHandle = null;
+  }
   const canvas = canvasRef.value;
   const item = activeItem.value;
 
@@ -443,128 +516,20 @@ function getTodayDate() {
   ].join("-");
 }
 
-function formatWatermarkDate(value: string) {
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  }).format(new Date(`${value}T00:00:00`));
-}
-
-function getWatermarkLines(settings: WatermarkSettings) {
-  const lines = settings.watermarkText.trim() ? [settings.watermarkText] : [];
-  if (settings.includeDate && settings.watermarkDate)
-    lines.push(formatWatermarkDate(settings.watermarkDate));
-  return lines;
-}
-
-function renderTextWatermark(
-  ctx: CanvasRenderingContext2D,
-  canvas: HTMLCanvasElement,
-  settings: WatermarkSettings,
-) {
-  const { watermarkColor, fontSize, repeat, rotation } = settings;
-  const watermarkLines = getWatermarkLines(settings);
-  if (watermarkLines.length === 0) return;
-
-  ctx.font = `bold ${fontSize}px Arial, sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = watermarkColor;
-
-  const r = parseInt(watermarkColor.slice(1, 3), 16);
-  const g = parseInt(watermarkColor.slice(3, 5), 16);
-  const b = parseInt(watermarkColor.slice(5, 7), 16);
-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-  ctx.strokeStyle =
-    luminance > 0.5 ? "rgba(0, 0, 0, 0.35)" : "rgba(255, 255, 255, 0.35)";
-  ctx.lineWidth = Math.max(1, fontSize / 16);
-  ctx.lineJoin = "round";
-
-  const lineHeight = fontSize * 1.35;
-  function drawText() {
-    watermarkLines.forEach((text, index) => {
-      const y = (index - (watermarkLines.length - 1) / 2) * lineHeight;
-      ctx.strokeText(text, 0, y);
-      ctx.fillText(text, 0, y);
-    });
-  }
-
-  if (repeat) {
-    const textWidth = Math.max(...watermarkLines.map(text => ctx.measureText(text).width));
-    const textHeight = lineHeight * watermarkLines.length;
-    const gapX = Math.max(textWidth + fontSize * 2, 180);
-    const gapY = Math.max(textHeight + fontSize * 2, fontSize * 4, 140);
-
-    for (let y = -canvas.height; y < canvas.height * 2; y += gapY) {
-      for (let x = -canvas.width; x < canvas.width * 2; x += gapX) {
-        ctx.save();
-        ctx.translate(x, y);
-        ctx.rotate((rotation * Math.PI) / 180);
-        drawText();
-        ctx.restore();
-      }
-    }
-  } else {
-    const pos = getPosition(canvas, settings);
-    ctx.translate(pos.x, pos.y);
-    ctx.rotate((rotation * Math.PI) / 180);
-    drawText();
-  }
-}
-
-function renderLogoWatermark(
-  ctx: CanvasRenderingContext2D,
-  canvas: HTMLCanvasElement,
-  settings: WatermarkSettings,
-) {
-  const { logoImage: logo, logoScale, repeat, rotation } = settings;
-  if (!logo) return;
-
-  const logoW = canvas.width * (logoScale / 100);
-  const logoH = (logo.naturalHeight / logo.naturalWidth) * logoW;
-
-  function drawLogo(x: number, y: number) {
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate((rotation * Math.PI) / 180);
-    ctx.drawImage(logo!, -logoW / 2, -logoH / 2, logoW, logoH);
-    ctx.restore();
-  }
-
-  if (repeat) {
-    const gapX = Math.max(logoW * 1.8, 180);
-    const gapY = Math.max(logoH * 2.5, 140);
-
-    for (let y = -canvas.height; y < canvas.height * 2; y += gapY) {
-      for (let x = -canvas.width; x < canvas.width * 2; x += gapX) {
-        drawLogo(x, y);
-      }
-    }
-  } else {
-    const pos = getPosition(canvas, settings);
-    drawLogo(pos.x, pos.y);
-  }
-}
-
 function getPosition(
   canvas: HTMLCanvasElement,
   settings = currentSettings.value,
 ) {
-  return {
-    x: canvas.width * settings.offsetX,
-    y: canvas.height * settings.offsetY,
-  };
+  return calcPosition(canvas, settings);
 }
 
-// ── Download ──
-function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) resolve(blob);
-      else reject(new Error("导出失败"));
-    }, "image/png");
-  });
+// ── 下载 ──
+function canvasToBlob(
+  canvas: HTMLCanvasElement,
+  format: ExportFormat = exportFormat.value,
+  quality: number = exportQuality.value,
+): Promise<Blob> {
+  return utilsCanvasToBlob(canvas, format, quality);
 }
 
 async function downloadSingle() {
@@ -577,13 +542,16 @@ async function downloadSingle() {
   exportStage.value = "rendering";
 
   try {
-    const blob = await canvasToBlob(canvas);
+    const format = exportFormat.value;
+    const quality = exportQuality.value;
+    const ext = format === "jpeg" ? "jpg" : format;
+    const blob = await canvasToBlob(canvas, format, quality);
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
 
     const baseName = item.name.replace(/\.[^/.]+$/, "");
-    link.download = `${baseName}_watermark.png`;
+    link.download = `${baseName}_watermark.${ext}`;
     link.click();
 
     URL.revokeObjectURL(url);
@@ -615,6 +583,10 @@ async function downloadBatchZip() {
     const ctx = offscreen.getContext("2d");
     if (!ctx) throw new Error("无法创建画布");
 
+    const format = exportFormat.value;
+    const quality = exportQuality.value;
+    const ext = format === "jpeg" ? "jpg" : format;
+
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
 
@@ -625,18 +597,18 @@ async function downloadBatchZip() {
       ctx.drawImage(item.img, 0, 0);
       applyWatermark(ctx, offscreen, item.watermark);
 
-      const blob = await canvasToBlob(offscreen);
+      const blob = await canvasToBlob(offscreen, format, quality);
       const baseName = item.name.replace(/\.[^/.]+$/, "");
-      let fileName = `${baseName}_watermark.png`;
+      let fileName = `${baseName}_watermark.${ext}`;
       let suffix = 2;
       while (zip.file(fileName)) {
-        fileName = `${baseName}_watermark_${suffix++}.png`;
+        fileName = `${baseName}_watermark_${suffix++}.${ext}`;
       }
       zip.file(fileName, blob);
 
       batchProgress.value = i + 1;
 
-      // Yield to keep UI responsive
+      // 让出执行权，以保持界面响应灵敏
       await new Promise((r) => setTimeout(r, 0));
     }
 
@@ -667,7 +639,7 @@ async function downloadBatchZip() {
   }
 }
 
-// ── Pointer drag ──
+// ── 指针拖拽 ──
 function handlePointerDown(event: PointerEvent) {
   if (
     batchProcessing.value ||
@@ -709,7 +681,7 @@ function handlePointerMove(event: PointerEvent) {
     Math.min(1, startOffsetY + (event.clientY - dragStartY) / rect.height),
   );
 
-  renderCanvas();
+  scheduleRenderCanvas();
 }
 
 function handlePointerUp() {
@@ -735,14 +707,22 @@ watch(
   { deep: true, flush: "post" },
 );
 
-// The empty-state transition mounts the canvas after the file handler's nextTick.
+// 空状态转换会在文件处理程序的 `nextTick` 之后挂载画布。
 watch(canvasRef, renderCanvas, { flush: "post" });
 
 onBeforeUnmount(() => {
   disposed = true;
+  if (rafHandle !== null && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(rafHandle);
+    rafHandle = null;
+  }
   clearTimeout(exportDismissTimer);
   images.value.forEach((item) => URL.revokeObjectURL(item.url));
   logoUrls.forEach((url) => URL.revokeObjectURL(url));
+});
+
+defineExpose({
+  getPosition,
 });
 </script>
 
@@ -758,6 +738,35 @@ onBeforeUnmount(() => {
         }}</span>
       </div>
       <div class="toolbar-actions">
+        <div
+          v-if="hasImages"
+          class="export-format-wrapper"
+          role="group"
+          aria-label="导出格式与画质"
+        >
+          <span class="format-label">格式</span>
+          <a-radio-group
+            v-model:value="exportFormat"
+            size="small"
+            :disabled="batchProcessing"
+            class="format-radio-group"
+          >
+            <a-radio-button value="png">PNG</a-radio-button>
+            <a-radio-button value="jpeg">JPG</a-radio-button>
+            <a-radio-button value="webp">WebP</a-radio-button>
+          </a-radio-group>
+          <div v-if="exportFormat !== 'png'" class="format-quality-inline">
+            <span class="quality-label">{{ exportQuality }}%</span>
+            <a-slider
+              v-model:value="exportQuality"
+              :min="50"
+              :max="100"
+              :step="5"
+              :disabled="batchProcessing"
+              aria-label-for-handle="导出画质"
+            />
+          </div>
+        </div>
         <a-button
           v-if="hasImages"
           class="import-action"
@@ -879,6 +888,26 @@ onBeforeUnmount(() => {
           <div class="panel-heading">
             <h2 id="preview-title">图片预览</h2>
             <span class="live-label"><i></i>实时预览</span>
+            <div v-if="hasImages" class="preview-zoom-toggle">
+              <button
+                type="button"
+                class="zoom-btn"
+                :class="{ 'is-active': zoomMode === 'fit' }"
+                title="自适应居中显示"
+                @click="zoomMode = 'fit'"
+              >
+                自适应
+              </button>
+              <button
+                type="button"
+                class="zoom-btn"
+                :class="{ 'is-active': zoomMode === 'actual' }"
+                title="100% 原始比例查看细节"
+                @click="zoomMode = 'actual'"
+              >
+                1:1
+              </button>
+            </div>
           </div>
           <a href="#watermark-settings" class="section-link">调整水印 ↓</a>
           <span v-if="hasImages" class="image-counter"
@@ -962,11 +991,17 @@ onBeforeUnmount(() => {
                   {{ activeItem?.img.naturalHeight }} px</span
                 >
               </div>
-              <div class="preview-stage">
+              <div
+                class="preview-stage"
+                :class="{ 'is-actual-size': zoomMode === 'actual' }"
+              >
                 <canvas
                   ref="canvasRef"
                   class="preview-canvas"
-                  :class="{ 'cursor-crosshair': !repeat }"
+                  :class="{
+                    'cursor-crosshair': !repeat,
+                    'is-actual-size': zoomMode === 'actual',
+                  }"
                   :style="{
                     touchAction:
                       !repeat && touchDragEnabled ? 'none' : 'pan-y pinch-zoom',
@@ -1051,8 +1086,24 @@ onBeforeUnmount(() => {
                   >{{ idx + 1 }}</span
                 ><span v-if="item.watermark" class="thumbnail-custom"
                   >单独</span
-                ></span
-              >
+                ><button
+                  type="button"
+                  class="thumbnail-delete-btn"
+                  title="删除此图片"
+                  :disabled="batchProcessing"
+                  @click.stop="removeImage(idx)"
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.5"
+                  >
+                    <path d="M18 6 6 18M6 6l12 12" />
+                  </svg></button
+              ></span>
               <span class="thumbnail-name" :title="item.name">{{
                 item.name
               }}</span>
@@ -1090,20 +1141,39 @@ onBeforeUnmount(() => {
               >{{ customWatermark ? "仅当前图片" : "统一设置" }}</span
             >
           </div>
-          <div v-if="activeItem" class="scope-controls">
-            <a-checkbox
-              v-model:checked="customWatermark"
-              :disabled="batchProcessing"
-              >单独设置当前图片</a-checkbox
-            >
-            <a-button
-              v-if="customWatermark"
-              type="link"
-              size="small"
-              :disabled="batchProcessing"
-              @click="customWatermark = false"
-              >恢复统一设置</a-button
-            >
+          <div class="scope-controls">
+            <template v-if="activeItem">
+              <a-checkbox
+                v-model:checked="customWatermark"
+                :disabled="batchProcessing"
+                >单独设置当前图片</a-checkbox
+              >
+              <a-button
+                v-if="customWatermark"
+                type="link"
+                size="small"
+                :disabled="batchProcessing"
+                @click="customWatermark = false"
+                >恢复统一设置</a-button
+              >
+              <a-button
+                v-else
+                type="link"
+                size="small"
+                :disabled="batchProcessing"
+                @click="resetSharedSettings"
+                >重置默认</a-button
+              >
+            </template>
+            <template v-else>
+              <a-button
+                type="link"
+                size="small"
+                :disabled="batchProcessing"
+                @click="resetSharedSettings"
+                >重置默认设置</a-button
+              >
+            </template>
           </div>
           <p
             class="scope-note"
@@ -1113,7 +1183,7 @@ onBeforeUnmount(() => {
             {{
               customWatermark
                 ? activeItem?.name + " · 修改仅对此图片生效"
-                : "修改会应用到所有未单独设置的图片"
+                : "修改会应用到所有未单独设置的图片，已保存至本地"
             }}
           </p>
         </div>
@@ -1195,7 +1265,7 @@ onBeforeUnmount(() => {
                             v-model:value="watermarkText"
                             :disabled="batchProcessing"
                             aria-label="水印文字"
-                            :rows="2"
+                            :rows="1"
                             placeholder="输入你的水印内容"
                             :maxlength="100"
                             show-count
@@ -1328,6 +1398,37 @@ onBeforeUnmount(() => {
                       <div class="range-labels">
                         <span>12 px</span><span>120 px</span>
                       </div>
+                      <div class="adaptive-font-field">
+                        <div class="adaptive-font-copy">
+                          <label for="adaptive-font-switch">自适应图片分辨率</label>
+                          <small>按原图长宽等比缩放，不同尺寸大图小图视觉一致</small>
+                        </div>
+                        <a-switch
+                          id="adaptive-font-switch"
+                          v-model:checked="adaptiveFont"
+                          :disabled="batchProcessing"
+                          size="small"
+                          aria-label="自适应图片分辨率"
+                        />
+                      </div>
+                    </div>
+                    <div class="setting-field">
+                      <label>字体风格</label>
+                      <a-radio-group
+                        v-model:value="fontFamily"
+                        :disabled="batchProcessing"
+                        class="font-radio-group w-full"
+                        size="small"
+                      >
+                        <a-radio-button
+                          v-for="opt in fontOptions"
+                          :key="opt.value"
+                          :value="opt.value"
+                          class="font-radio-btn"
+                        >
+                          <span :style="{ fontFamily: opt.value }">{{ opt.label }}</span>
+                        </a-radio-button>
+                      </a-radio-group>
                     </div>
                   </template>
                   <div v-else class="setting-field">
@@ -1480,6 +1581,37 @@ onBeforeUnmount(() => {
                       }}
                     </p>
                   </div>
+                  <div v-if="repeat" class="setting-field">
+                    <div class="field-heading">
+                      <label>平铺间距</label>
+                      <output>{{ tileSpacing ?? 100 }}<small>%</small></output>
+                    </div>
+                    <a-slider
+                      v-model:value="tileSpacing"
+                      :disabled="batchProcessing"
+                      :min="50"
+                      :max="200"
+                      :step="5"
+                      aria-label-for-handle="平铺间距"
+                    />
+                    <div class="range-labels">
+                      <span>紧密 (50%)</span><span>适中 (100%)</span
+                      ><span>宽松 (200%)</span>
+                    </div>
+                    <div class="adaptive-font-field mt-3">
+                      <div class="adaptive-font-copy">
+                        <label for="stagger-switch">交错错位平铺</label>
+                        <small>奇偶行横向错开 50%，排版更柔和美观、防裁切更强</small>
+                      </div>
+                      <a-switch
+                        id="stagger-switch"
+                        v-model:checked="stagger"
+                        :disabled="batchProcessing"
+                        size="small"
+                        aria-label="交错错位平铺"
+                      />
+                    </div>
+                  </div>
                   <Transition name="layout-options">
                     <div v-if="!repeat" class="position-reveal">
                       <div class="position-panel setting-field">
@@ -1601,6 +1733,66 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.export-format-wrapper {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  border-radius: 8px;
+  height: 38px;
+}
+.format-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.format-quality-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.format-quality-inline .quality-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--primary);
+  white-space: nowrap;
+  min-width: 34px;
+}
+.format-quality-inline :deep(.ant-slider) {
+  width: 65px;
+  margin: 0;
+}
+.adaptive-font-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--muted);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.adaptive-font-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.adaptive-font-copy label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--foreground);
+}
+.adaptive-font-copy small {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  line-height: 1.4;
 }
 .toolbar-actions :deep(.ant-btn) {
   height: 38px;
@@ -1726,6 +1918,11 @@ onBeforeUnmount(() => {
   background-size: 12px 12px;
   padding: 16px;
 }
+.preview-stage.is-actual-size {
+  overflow: auto;
+  display: block;
+  text-align: center;
+}
 .preview-canvas {
   display: block;
   width: auto;
@@ -1734,6 +1931,40 @@ onBeforeUnmount(() => {
   max-height: 100%;
   object-fit: contain;
   box-shadow: 0 3px 16px #25263b0d;
+}
+.preview-canvas.is-actual-size {
+  max-width: none;
+  max-height: none;
+  margin: auto;
+}
+.preview-zoom-toggle {
+  display: inline-flex;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+  margin-left: 6px;
+}
+.zoom-btn {
+  border: none;
+  background: transparent;
+  padding: 2px 7px;
+  font-size: 11px;
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: normal;
+}
+.zoom-btn:hover {
+  color: var(--foreground);
+}
+.zoom-btn.is-active {
+  background: #fff;
+  color: var(--primary);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 .preview-caption {
   display: flex;
@@ -1846,6 +2077,52 @@ onBeforeUnmount(() => {
   border-top-left-radius: 4px;
   color: white;
   background: #6558d9dd;
+}
+.thumbnail-delete-btn {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: rgba(36, 38, 59, 0.7);
+  color: #fff;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transform: scale(0.75);
+  transition: all 0.15s ease;
+  cursor: pointer;
+  z-index: 2;
+  padding: 0;
+}
+.thumbnail-button:hover .thumbnail-delete-btn {
+  opacity: 1;
+  transform: scale(1);
+}
+.thumbnail-delete-btn:hover {
+  background: #ff4d4f;
+  transform: scale(1.15);
+}
+.font-radio-group {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 8px;
+}
+.font-radio-group :deep(.ant-radio-button-wrapper) {
+  text-align: center;
+  border-radius: 7px !important;
+  font-size: 11px;
+  height: 32px;
+  line-height: 30px;
+  padding: 0 6px;
+  border-left-width: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .thumbnail-name {
   display: block;
@@ -2581,6 +2858,17 @@ onBeforeUnmount(() => {
     align-items: center;
     padding-bottom: 16px;
     gap: 10px;
+    flex-wrap: wrap;
+  }
+  .toolbar-actions {
+    flex-wrap: wrap;
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .export-format-wrapper {
+    order: -1;
+    width: 100%;
+    justify-content: space-between;
   }
   .workspace-heading {
     flex-direction: column;
