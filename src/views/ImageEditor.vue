@@ -28,6 +28,7 @@ interface WatermarkSettings {
   watermarkType: "text" | "logo";
   watermarkText: string;
   includeDate: boolean;
+  watermarkDate: string;
   watermarkColor: string;
   fontSize: number;
   logoUrl: string;
@@ -51,6 +52,7 @@ const sharedSettings = ref<WatermarkSettings>({
   watermarkType: "text",
   watermarkText: "仅供个人使用 · MarkFree",
   includeDate: false,
+  watermarkDate: getTodayDate(),
   watermarkColor: "#ffffff",
   fontSize: 48,
   logoUrl: "",
@@ -85,6 +87,7 @@ function setting<K extends keyof WatermarkSettings>(key: K) {
 const watermarkType = setting("watermarkType");
 const watermarkText = setting("watermarkText");
 const includeDate = setting("includeDate");
+const watermarkDate = setting("watermarkDate");
 const watermarkColor = setting("watermarkColor");
 const fontSize = setting("fontSize");
 const logoUrl = setting("logoUrl");
@@ -143,7 +146,6 @@ const purposeTemplates = [
   { label: "银行业务", text: "仅供银行业务使用" },
   { label: "资料审核", text: "仅供资料审核使用" },
 ];
-const currentDate = formatCurrentDate();
 
 function applyPurposeTemplate(text: string) {
   watermarkType.value = "text";
@@ -432,17 +434,27 @@ function renderCanvas() {
   applyWatermark(ctx, canvas, getWatermark(item));
 }
 
-function formatCurrentDate() {
+function getTodayDate() {
+  const now = new Date();
+  return [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function formatWatermarkDate(value: string) {
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
     month: "long",
     day: "numeric",
-  }).format(new Date());
+  }).format(new Date(`${value}T00:00:00`));
 }
 
 function getWatermarkLines(settings: WatermarkSettings) {
   const lines = settings.watermarkText.trim() ? [settings.watermarkText] : [];
-  if (settings.includeDate) lines.push(formatCurrentDate());
+  if (settings.includeDate && settings.watermarkDate)
+    lines.push(formatWatermarkDate(settings.watermarkDate));
   return lines;
 }
 
@@ -1190,17 +1202,22 @@ onBeforeUnmount(() => {
                           />
                           <div class="date-option">
                             <div class="date-copy">
-                              <label>自动添加日期</label>
-                              <span>{{ currentDate }}</span>
+                              <label for="watermark-date">添加日期</label>
+                              <input
+                                id="watermark-date"
+                                v-model="watermarkDate"
+                                type="date"
+                                :disabled="batchProcessing"
+                              />
                             </div>
                             <a-switch
                               v-model:checked="includeDate"
                               :disabled="batchProcessing"
-                              aria-label="自动添加日期"
+                              aria-label="添加日期"
                             />
                           </div>
                           <p class="field-note">
-                            开启后，日期会单独显示在水印文字下方。
+                            默认当天，可自行修改；开启后显示在水印文字下方。
                           </p>
                         </div>
                       </template>
@@ -2036,11 +2053,23 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
 }
-.date-copy > span {
-  color: #9699aa;
-  font-size: 11px;
+.date-copy > input {
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+.date-copy > input:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
 }
 .setting-field :deep(.ant-input-textarea-show-count::after) {
   margin-top: 5px;
